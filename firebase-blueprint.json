@@ -1,0 +1,122 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "bio": { "type": "string" },
+        "isPrivate": { "type": "boolean" },
+        "followersCount": { "type": "integer" },
+        "followingCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "createdAt"]
+    },
+    "Reel": {
+      "title": "Reel",
+      "description": "Short video post",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "creatorUid": { "type": "string" },
+        "creatorName": { "type": "string" },
+        "creatorPhoto": { "type": "string" },
+        "videoUrl": { "type": "string" },
+        "caption": { "type": "string" },
+        "likesCount": { "type": "integer" },
+        "commentsCount": { "type": "integer" },
+        "isPublic": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "creatorUid", "videoUrl", "createdAt"]
+    },
+    "Like": {
+      "title": "Like",
+      "description": "User like on a reel",
+      "type": "object",
+      "properties": {
+        "userUid": { "type": "string" },
+        "reelId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userUid", "reelId", "createdAt"]
+    },
+    "Comment": {
+      "title": "Comment",
+      "description": "User comment on a reel",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userUid": { "type": "string" },
+        "userName": { "type": "string" },
+        "userPhoto": { "type": "string" },
+        "reelId": { "type": "string" },
+        "text": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userUid", "reelId", "text", "createdAt"]
+    },
+    "Follow": {
+      "title": "Follow",
+      "description": "Follow relationship between users",
+      "type": "object",
+      "properties": {
+        "followerUid": { "type": "string" },
+        "followingUid": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["followerUid", "followingUid", "createdAt"]
+    },
+    "Story": {
+      "title": "Story",
+      "description": "Short-lived visual post",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "creatorUid": { "type": "string" },
+        "creatorName": { "type": "string" },
+        "creatorPhoto": { "type": "string" },
+        "mediaUrl": { "type": "string" },
+        "mediaType": { "type": "string", "enum": ["image", "video"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "creatorUid", "mediaUrl", "mediaType", "createdAt", "expiresAt"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "reels/{reelId}": {
+      "schema": "Reel",
+      "description": "Reel posts"
+    },
+    "stories/{storyId}": {
+      "schema": "Story",
+      "description": "User stories"
+    },
+    "reels/{reelId}/likes/{userId}": {
+      "schema": "Like",
+      "description": "Likes on a specific reel"
+    },
+    "reels/{reelId}/comments/{commentId}": {
+      "schema": "Comment",
+      "description": "Comments on a specific reel"
+    },
+    "users/{userId}/following/{followingId}": {
+      "schema": "Follow",
+      "description": "Users followed by a user"
+    },
+    "users/{userId}/followers/{followerId}": {
+      "schema": "Follow",
+      "description": "Users following a user"
+    }
+  }
+}

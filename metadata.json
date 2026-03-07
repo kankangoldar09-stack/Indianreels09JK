@@ -1,0 +1,5 @@
+{
+  "name": "INDIANREELS",
+  "description": "A vibrant Indian-themed short video platform with social features, profiles, and real-time interactions.",
+  "requestFramePermissions": ["camera", "microphone"]
+}

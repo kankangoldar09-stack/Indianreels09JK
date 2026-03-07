@@ -1,0 +1,80 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isValidUser(data) {
+      return data.uid is string && data.displayName is string;
+    }
+
+    function isValidReel(data) {
+      return data.creatorUid is string && data.videoUrl is string;
+    }
+
+    function isValidComment(data) {
+      return data.userUid is string && data.reelId is string && data.text is string;
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+    }
+
+    // Reels Collection
+    match /reels/{reelId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.creatorUid == request.auth.uid && isValidReel(request.resource.data);
+      allow update: if isAuthenticated() && (
+        (resource.data.creatorUid == request.auth.uid && isValidReel(request.resource.data)) ||
+        // Allow anyone to update counts (simplified for prototype, ideally use atomic increments)
+        (request.resource.data.diff(resource.data).affectedKeys().hasAny(['likesCount', 'commentsCount']))
+      );
+      allow delete: if isAuthenticated() && resource.data.creatorUid == request.auth.uid;
+    }
+
+    // Likes Subcollection
+    match /reels/{reelId}/likes/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId);
+    }
+
+    // Comments Subcollection
+    match /reels/{reelId}/comments/{commentId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.userUid == request.auth.uid && isValidComment(request.resource.data);
+      allow update: if isAuthenticated() && resource.data.userUid == request.auth.uid && isValidComment(request.resource.data);
+      allow delete: if isAuthenticated() && (resource.data.userUid == request.auth.uid || get(/databases/$(database)/documents/reels/$(reelId)).data.creatorUid == request.auth.uid);
+    }
+
+    // Following/Followers
+    match /users/{userId}/following/{followingId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId);
+    }
+    
+    match /users/{userId}/followers/{followerId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == followerId;
+    }
+
+    // Stories Collection
+    match /stories/{storyId} {
+      allow read: if isAuthenticated() && (
+        resource.data.creatorUid == request.auth.uid || 
+        exists(/databases/$(database)/documents/users/$(resource.data.creatorUid)/followers/$(request.auth.uid))
+      );
+      allow create: if isAuthenticated() && request.resource.data.creatorUid == request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.creatorUid == request.auth.uid;
+    }
+  }
+}
