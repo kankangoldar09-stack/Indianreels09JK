@@ -12,7 +12,7 @@ service cloud.firestore {
     }
     
     function isValidUser(data) {
-      return data.uid is string && data.displayName is string;
+      return data.uid is string && data.displayName is string && data.username is string;
     }
 
     function isValidReel(data) {

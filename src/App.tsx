@@ -4,7 +4,10 @@ import {
   signInWithPopup, 
   GoogleAuthProvider, 
   signOut,
-  User
+  User,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  updateProfile
 } from 'firebase/auth';
 import { 
   doc, 
@@ -22,7 +25,8 @@ import {
   serverTimestamp,
   getDocs
 } from 'firebase/firestore';
-import { auth, db } from './firebase';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { auth, db, storage } from './firebase';
 import { createClient } from '@supabase/supabase-js';
 import { UserProfile, Reel, ReelComment, ReelType, Story } from './types';
 import { 
@@ -837,13 +841,16 @@ const ReelCard: React.FC<ReelCardProps> = ({ reel, currentUser, isMuted, setIsMu
 };
 
 const AuthScreen = () => {
-  const handleGoogleSignIn = async () => {
-    const provider = new GoogleAuthProvider();
+  const [isLogin, setIsLogin] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [username, setUsername] = useState('');
+  const [profilePic, setProfilePic] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const createSupabaseProfile = async (user: User, customDisplayName?: string, customPhotoURL?: string, customUsername?: string) => {
     try {
-      const result = await signInWithPopup(auth, provider);
-      const user = result.user;
-      
-      // Check if user profile exists in Supabase
       const { data: existingProfile } = await supabase
         .from('profiles')
         .select('*')
@@ -851,13 +858,15 @@ const AuthScreen = () => {
         .single();
 
       if (!existingProfile) {
+        const baseUsername = customUsername || user.displayName?.toLowerCase().replace(/\s/g, '') || 'user' + Math.floor(Math.random() * 10000);
         await supabase
           .from('profiles')
           .insert([{
             id: user.uid,
-            display_name: user.displayName || 'Indian Reels User',
+            display_name: customDisplayName || user.displayName || 'Indian Reels User',
+            username: baseUsername,
             email: user.email,
-            photo_url: user.photoURL,
+            photo_url: customPhotoURL || user.photoURL,
             bio: 'Namaste! I am new here.',
             is_private: false,
             followers_count: 0,
@@ -865,8 +874,67 @@ const AuthScreen = () => {
             created_at: new Date().toISOString()
           }]);
       }
-    } catch (error) {
-      console.error("Auth error", error);
+    } catch (err) {
+      console.error("Supabase profile creation error:", err);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    const provider = new GoogleAuthProvider();
+    try {
+      const result = await signInWithPopup(auth, provider);
+      await createSupabaseProfile(result.user);
+    } catch (err: any) {
+      console.error("Auth error", err);
+      if (err.code === 'auth/popup-closed-by-user') {
+        setError("Login popup was closed. Please try again.");
+      } else if (err.code === 'auth/unauthorized-domain') {
+        setError("This domain is not authorized for Google Login. Please add it in Firebase Console.");
+      } else {
+        setError(err.message || "Failed to sign in with Google.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+
+    try {
+      if (isLogin) {
+        const result = await signInWithEmailAndPassword(auth, email, password);
+        await createSupabaseProfile(result.user);
+      } else {
+        if (!username.trim()) {
+          throw new Error("Please enter a username.");
+        }
+
+        const result = await createUserWithEmailAndPassword(auth, email, password);
+        let photoURL = '';
+
+        if (profilePic) {
+          const storageRef = ref(storage, `profile_pics/${result.user.uid}`);
+          await uploadBytes(storageRef, profilePic);
+          photoURL = await getDownloadURL(storageRef);
+        }
+
+        await updateProfile(result.user, {
+          displayName: username,
+          photoURL: photoURL
+        });
+
+        await createSupabaseProfile(result.user, username, photoURL, username);
+      }
+    } catch (err: any) {
+      console.error("Email auth error:", err);
+      setError(err.message || "Authentication failed.");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -875,35 +943,135 @@ const AuthScreen = () => {
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
-        className="w-full max-w-md bg-white dark:bg-zinc-900 rounded-3xl p-8 shadow-2xl border border-zinc-200 dark:border-zinc-800 text-center"
+        className="w-full max-w-md bg-white dark:bg-zinc-900 rounded-3xl p-8 shadow-2xl border border-zinc-200 dark:border-zinc-800"
       >
         <div className="mb-8 flex flex-col items-center">
-          <div className="w-20 h-20 mb-4 relative">
+          <div className="w-16 h-16 mb-4 relative">
             <div className="absolute inset-0 bg-gradient-to-tr from-orange-500 via-white to-green-600 rounded-2xl rotate-12 opacity-20 animate-pulse" />
             <div className="relative w-full h-full bg-white dark:bg-zinc-800 rounded-2xl shadow-lg flex items-center justify-center border border-zinc-100 dark:border-zinc-700">
-              <div className="w-0 h-0 border-t-[12px] border-t-transparent border-l-[20px] border-l-orange-500 border-b-[12px] border-b-transparent ml-1" />
+              <div className="w-0 h-0 border-t-[10px] border-t-transparent border-l-[16px] border-l-orange-500 border-b-[10px] border-b-transparent ml-1" />
             </div>
           </div>
-          <h1 className="text-4xl font-black mb-2 tracking-tighter">
+          <h1 className="text-3xl font-black mb-1 tracking-tighter text-center">
             <span className="text-orange-500">INDIAN</span>
             <span className="text-zinc-900 dark:text-white">REELS</span>
           </h1>
-          <p className="text-zinc-500 dark:text-zinc-400 font-medium">The heart of Indian creativity.</p>
-        </div>
-        
-        <div className="space-y-4">
-          <button 
-            onClick={handleGoogleSignIn}
-            className="w-full py-4 px-6 bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 rounded-2xl font-bold flex items-center justify-center gap-3 hover:scale-[1.02] active:scale-[0.98] transition-all shadow-lg"
-          >
-            <img src="https://www.google.com/favicon.ico" className="w-5 h-5" alt="" />
-            Continue with Google
-          </button>
-          
-          <p className="text-[10px] text-zinc-400 mt-6 uppercase tracking-widest font-bold">
-            Secure Login via Firebase
+          <p className="text-zinc-500 dark:text-zinc-400 text-sm font-medium text-center">
+            {isLogin ? "Welcome back to the heart of India." : "Join the community of Indian creators."}
           </p>
         </div>
+
+        {error && (
+          <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-900/30 rounded-2xl text-red-600 dark:text-red-400 text-sm font-medium">
+            {error}
+          </div>
+        )}
+        
+        <form onSubmit={handleEmailAuth} className="space-y-4 mb-6">
+          {!isLogin && (
+            <>
+              <div className="flex flex-col items-center mb-4">
+                <label className="relative cursor-pointer group">
+                  <div className="w-20 h-20 rounded-full bg-zinc-100 dark:bg-zinc-800 border-2 border-dashed border-zinc-300 dark:border-zinc-700 flex items-center justify-center overflow-hidden group-hover:border-orange-500 transition-colors">
+                    {profilePic ? (
+                      <img src={URL.createObjectURL(profilePic)} className="w-full h-full object-cover" alt="Preview" />
+                    ) : (
+                      <Camera className="text-zinc-400 group-hover:text-orange-500" size={24} />
+                    )}
+                  </div>
+                  <input 
+                    type="file" 
+                    accept="image/*" 
+                    className="hidden" 
+                    onChange={(e) => setProfilePic(e.target.files?.[0] || null)}
+                  />
+                  <div className="absolute -bottom-1 -right-1 bg-orange-500 text-white p-1.5 rounded-full shadow-lg">
+                    <PlusSquare size={12} />
+                  </div>
+                </label>
+                <span className="text-[10px] text-zinc-500 mt-2">Profile Picture (Optional)</span>
+              </div>
+
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                  <UserIcon className="text-zinc-400" size={18} />
+                </div>
+                <input 
+                  type="text"
+                  placeholder="Username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  className="w-full pl-11 pr-4 py-3.5 bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800 rounded-2xl outline-none focus:ring-2 focus:ring-orange-500 transition-all text-sm dark:text-white"
+                  required
+                />
+              </div>
+            </>
+          )}
+
+          <div className="relative">
+            <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+              <MessageCircle className="text-zinc-400" size={18} />
+            </div>
+            <input 
+              type="email"
+              placeholder="Email Address"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="w-full pl-11 pr-4 py-3.5 bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800 rounded-2xl outline-none focus:ring-2 focus:ring-orange-500 transition-all text-sm dark:text-white"
+              required
+            />
+          </div>
+
+          <div className="relative">
+            <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+              <Settings className="text-zinc-400" size={18} />
+            </div>
+            <input 
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full pl-11 pr-4 py-3.5 bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800 rounded-2xl outline-none focus:ring-2 focus:ring-orange-500 transition-all text-sm dark:text-white"
+              required
+            />
+          </div>
+
+          <button 
+            type="submit"
+            disabled={loading}
+            className="w-full py-4 bg-orange-500 text-white rounded-2xl font-bold hover:bg-orange-600 active:scale-[0.98] transition-all shadow-lg shadow-orange-500/20 disabled:opacity-50"
+          >
+            {loading ? "Please wait..." : (isLogin ? "Sign In" : "Create Account")}
+          </button>
+        </form>
+
+        <div className="relative mb-6">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-zinc-100 dark:border-zinc-800"></div>
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-white dark:bg-zinc-900 px-4 text-zinc-400 font-medium tracking-widest">Or continue with</span>
+          </div>
+        </div>
+
+        <button 
+          onClick={handleGoogleSignIn}
+          disabled={loading}
+          className="w-full py-4 px-6 bg-zinc-50 dark:bg-zinc-800/50 text-zinc-900 dark:text-white border border-zinc-100 dark:border-zinc-800 rounded-2xl font-bold flex items-center justify-center gap-3 hover:bg-zinc-100 dark:hover:bg-zinc-800 active:scale-[0.98] transition-all disabled:opacity-50"
+        >
+          <img src="https://www.google.com/favicon.ico" className="w-5 h-5" alt="" />
+          Google
+        </button>
+
+        <p className="mt-8 text-sm text-zinc-500 dark:text-zinc-400 text-center">
+          {isLogin ? "Don't have an account?" : "Already have an account?"}
+          <button 
+            onClick={() => setIsLogin(!isLogin)}
+            className="ml-2 text-orange-500 font-bold hover:underline"
+          >
+            {isLogin ? "Sign Up" : "Sign In"}
+          </button>
+        </p>
       </motion.div>
       
       {/* Decorative elements */}

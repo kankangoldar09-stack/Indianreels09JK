@@ -1,6 +1,7 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
+import { getStorage } from 'firebase/storage';
 import firebaseConfigJson from '../firebase-applet-config.json';
 
 const firebaseConfig = {
@@ -35,6 +36,15 @@ export const auth = (() => {
     return getAuth(app);
   } catch (e) {
     console.error("Firebase Auth initialization failed:", e);
+    return {} as any;
+  }
+})();
+
+export const storage = (() => {
+  try {
+    return getStorage(app);
+  } catch (e) {
+    console.error("Firebase Storage initialization failed:", e);
     return {} as any;
   }
 })();
