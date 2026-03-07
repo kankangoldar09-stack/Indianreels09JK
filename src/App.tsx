@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Component } from 'react';
 import { 
   onAuthStateChanged, 
   signInWithPopup, 
@@ -53,10 +53,93 @@ import {
 // Initialize Supabase
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// Guard against empty URL to prevent crash
+let supabase: any;
+try {
+  if (supabaseUrl && supabaseAnonKey) {
+    supabase = createClient(supabaseUrl, supabaseAnonKey);
+  } else {
+    console.warn("Supabase credentials missing. Some features may not work.");
+    // Mock supabase to prevent crashes on method calls
+    supabase = {
+      from: () => ({
+        select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: null }), order: () => Promise.resolve({ data: [] }) }), order: () => Promise.resolve({ data: [] }), single: () => Promise.resolve({ data: null }) }),
+        insert: () => Promise.resolve({ error: null }),
+        update: () => ({ eq: () => Promise.resolve({ error: null }) }),
+        delete: () => ({ eq: () => ({ eq: () => Promise.resolve({ error: null }) }) }),
+        upsert: () => Promise.resolve({ error: null }),
+      }),
+      storage: {
+        from: () => ({
+          upload: () => Promise.resolve({ error: null }),
+          getPublicUrl: () => ({ data: { publicUrl: '' } }),
+        }),
+      },
+      channel: () => ({ on: () => ({ subscribe: () => ({}) }), subscribe: () => ({}) }),
+      removeChannel: () => {},
+      rpc: () => Promise.resolve({ error: null }),
+    };
+  }
+} catch (e) {
+  console.error("Failed to initialize Supabase:", e);
+}
+
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+
+// --- Error Boundary ---
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends (React.Component as any) {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    const { hasError, error } = this.state;
+    if (hasError) {
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-zinc-50 dark:bg-black p-6 text-center">
+          <div className="w-20 h-20 bg-red-100 dark:bg-red-900/20 rounded-full flex items-center justify-center mb-6">
+            <X className="text-red-500" size={40} />
+          </div>
+          <h1 className="text-2xl font-bold mb-2">Something went wrong</h1>
+          <p className="text-zinc-500 dark:text-zinc-400 mb-8 max-w-md">
+            The application encountered an unexpected error. This might be due to missing configuration or a temporary issue.
+          </p>
+          <div className="bg-zinc-100 dark:bg-zinc-900 p-4 rounded-xl mb-8 w-full max-w-lg overflow-auto text-left">
+            <code className="text-xs text-red-500 font-mono">
+              {error?.toString()}
+            </code>
+          </div>
+          <button 
+            onClick={() => window.location.reload()}
+            className="px-8 py-3 bg-orange-500 text-white rounded-2xl font-bold shadow-lg hover:bg-orange-600 transition-colors"
+          >
+            Reload Application
+          </button>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -1899,6 +1982,8 @@ const SearchScreen = ({ reels, setActiveTab, onReelClick, onViewProfile }: { ree
 
 // --- Main App ---
 
+// --- App Component ---
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -2100,24 +2185,31 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-white dark:bg-black">
-        <motion.div 
-          animate={{ scale: [1, 1.2, 1] }}
-          transition={{ repeat: Infinity, duration: 1.5 }}
-          className="text-4xl font-black text-orange-500"
-        >
-          IR
-        </motion.div>
-      </div>
+      <ErrorBoundary>
+        <div className="min-h-screen flex items-center justify-center bg-white dark:bg-black">
+          <motion.div 
+            animate={{ scale: [1, 1.2, 1] }}
+            transition={{ repeat: Infinity, duration: 1.5 }}
+            className="text-4xl font-black text-orange-500"
+          >
+            IR
+          </motion.div>
+        </div>
+      </ErrorBoundary>
     );
   }
 
   if (!user) {
-    return <AuthScreen />;
+    return (
+      <ErrorBoundary>
+        <AuthScreen />
+      </ErrorBoundary>
+    );
   }
 
   return (
-    <div className="min-h-screen bg-white dark:bg-black text-zinc-900 dark:text-white">
+    <ErrorBoundary>
+      <div className="min-h-screen bg-white dark:bg-black text-zinc-900 dark:text-white">
       <Navbar activeTab={activeTab} setActiveTab={setActiveTab} user={user} />
       
       <main className={cn("flex-1", activeTab !== 'reels' && "pb-16 md:pb-0")}>
@@ -2263,5 +2355,6 @@ export default function App() {
         </AnimatePresence>
       </main>
     </div>
+    </ErrorBoundary>
   );
 }

@@ -12,6 +12,29 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID || firebaseConfigJson.appId,
 };
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, import.meta.env.VITE_FIREBASE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId);
-export const auth = getAuth(app);
+let app;
+try {
+  app = initializeApp(firebaseConfig);
+} catch (e) {
+  console.error("Firebase initialization failed:", e);
+  // Create a dummy app if it fails
+  app = {} as any;
+}
+
+export const db = (() => {
+  try {
+    return getFirestore(app, import.meta.env.VITE_FIREBASE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId);
+  } catch (e) {
+    console.error("Firestore initialization failed:", e);
+    return {} as any;
+  }
+})();
+
+export const auth = (() => {
+  try {
+    return getAuth(app);
+  } catch (e) {
+    console.error("Firebase Auth initialization failed:", e);
+    return {} as any;
+  }
+})();
