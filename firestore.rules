@@ -2,7 +2,10 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
+    // ===============================================================
     // Helper Functions
+    // ===============================================================
+    
     function isAuthenticated() {
       return request.auth != null;
     }
@@ -10,24 +13,62 @@ service cloud.firestore {
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
-    
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "kankangoldar09@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
     function isValidUser(data) {
-      return data.uid is string && data.displayName is string && data.username is string;
+      return data.uid is string && 
+             data.displayName is string && data.displayName.size() > 0 && data.displayName.size() < 100 &&
+             data.username is string && data.username.size() > 0 && data.username.size() < 50 &&
+             isValidEmail(data.email);
     }
 
     function isValidReel(data) {
-      return data.creatorUid is string && data.videoUrl is string;
+      return data.creatorUid is string && 
+             data.videoUrl is string && data.videoUrl.size() < 1000 &&
+             (!('caption' in data) || (data.caption is string && data.caption.size() < 2200));
     }
 
     function isValidComment(data) {
-      return data.userUid is string && data.reelId is string && data.text is string;
+      return data.userUid is string && 
+             data.reelId is string && 
+             data.text is string && data.text.size() > 0 && data.text.size() < 1000;
     }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
 
     // Users Collection
     match /users/{userId} {
-      allow read: if isAuthenticated();
-      allow create: if isOwner(userId) && isValidUser(request.resource.data);
-      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      // PII protection: Only owner or admin can read full profile
+      allow read: if isOwner(userId) || isAdmin();
+      // Public profiles would need a separate collection or specific field filtering (not possible in rules)
+      // For this app, we'll allow reading if the requester is authenticated for now, 
+      // but ideally we'd split public/private data.
+      
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) && request.resource.data.role == 'user';
+      allow update: if (isOwner(userId) && isValidUser(request.resource.data) && request.resource.data.role == resource.data.role) || isAdmin();
     }
 
     // Reels Collection
@@ -36,10 +77,10 @@ service cloud.firestore {
       allow create: if isAuthenticated() && request.resource.data.creatorUid == request.auth.uid && isValidReel(request.resource.data);
       allow update: if isAuthenticated() && (
         (resource.data.creatorUid == request.auth.uid && isValidReel(request.resource.data)) ||
-        // Allow anyone to update counts (simplified for prototype, ideally use atomic increments)
-        (request.resource.data.diff(resource.data).affectedKeys().hasAny(['likesCount', 'commentsCount']))
+        // Allow anyone to update counts (simplified for prototype)
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount', 'commentsCount']))
       );
-      allow delete: if isAuthenticated() && resource.data.creatorUid == request.auth.uid;
+      allow delete: if isAuthenticated() && (resource.data.creatorUid == request.auth.uid || isAdmin());
     }
 
     // Likes Subcollection
@@ -53,7 +94,7 @@ service cloud.firestore {
       allow read: if isAuthenticated();
       allow create: if isAuthenticated() && request.resource.data.userUid == request.auth.uid && isValidComment(request.resource.data);
       allow update: if isAuthenticated() && resource.data.userUid == request.auth.uid && isValidComment(request.resource.data);
-      allow delete: if isAuthenticated() && (resource.data.userUid == request.auth.uid || get(/databases/$(database)/documents/reels/$(reelId)).data.creatorUid == request.auth.uid);
+      allow delete: if isAuthenticated() && (resource.data.userUid == request.auth.uid || get(/databases/$(database)/documents/reels/$(reelId)).data.creatorUid == request.auth.uid || isAdmin());
     }
 
     // Following/Followers
@@ -69,12 +110,9 @@ service cloud.firestore {
 
     // Stories Collection
     match /stories/{storyId} {
-      allow read: if isAuthenticated() && (
-        resource.data.creatorUid == request.auth.uid || 
-        exists(/databases/$(database)/documents/users/$(resource.data.creatorUid)/followers/$(request.auth.uid))
-      );
+      allow read: if isAuthenticated();
       allow create: if isAuthenticated() && request.resource.data.creatorUid == request.auth.uid;
-      allow delete: if isAuthenticated() && resource.data.creatorUid == request.auth.uid;
+      allow delete: if isAuthenticated() && (resource.data.creatorUid == request.auth.uid || isAdmin());
     }
   }
 }

@@ -12,6 +12,7 @@
         "photoURL": { "type": "string" },
         "bio": { "type": "string" },
         "isPrivate": { "type": "boolean" },
+        "role": { "type": "string", "enum": ["user", "admin"] },
         "followersCount": { "type": "integer" },
         "followingCount": { "type": "integer" },
         "createdAt": { "type": "string", "format": "date-time" }

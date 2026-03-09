@@ -12,6 +12,7 @@ import {
 import { 
   doc, 
   getDoc, 
+  getDocFromServer,
   setDoc, 
   collection, 
   query, 
@@ -23,10 +24,10 @@ import {
   deleteDoc,
   where,
   serverTimestamp,
-  getDocs
+  getDocs,
+  writeBatch
 } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { auth, db, storage } from './firebase';
+import { auth, db, handleFirestoreError, OperationType } from './firebase';
 import { createClient } from '@supabase/supabase-js';
 import { UserProfile, Reel, ReelComment, ReelType, Story } from './types';
 import { 
@@ -155,8 +156,10 @@ function cn(...inputs: ClassValue[]) {
 const StoryBar = ({ user }: { user: User | null }) => {
   const [stories, setStories] = useState<Story[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedStory, setSelectedStory] = useState<Story | null>(null);
+  const [viewerState, setViewerState] = useState<{ userIndex: number, storyIndex: number } | null>(null);
   const [followingUids, setFollowingUids] = useState<string[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!user) {
@@ -181,35 +184,52 @@ const StoryBar = ({ user }: { user: User | null }) => {
   }, [user]);
 
   useEffect(() => {
-    if (!user || followingUids.length === 0) {
+    if (!user || !db || typeof db.type !== 'string' || followingUids.length === 0) {
       if (!user) setLoading(false);
       return;
     }
 
-    const storiesRef = collection(db, 'stories');
-    const now = new Date().toISOString();
-    
-    // Filter by following UIDs if possible (Firestore 'in' limit is 30)
-    const limitedUids = followingUids.slice(0, 30);
-    
-    const q = query(
-      storiesRef,
-      where('creatorUid', 'in', limitedUids),
-      where('expiresAt', '>', now),
-      orderBy('expiresAt', 'desc')
-    );
+    try {
+      const storiesRef = collection(db, 'stories');
+      const now = new Date().toISOString();
+      
+      // Filter by following UIDs if possible (Firestore 'in' limit is 30)
+      const limitedUids = followingUids.slice(0, 30);
+      
+      if (limitedUids.length === 0) {
+        setLoading(false);
+        return;
+      }
+      
+      const q = query(
+        storiesRef,
+        where('creatorUid', 'in', limitedUids),
+        where('expiresAt', '>', now),
+        orderBy('expiresAt', 'desc')
+      );
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const allStories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Story));
-      setStories(allStories);
-      setLoading(false);
-    }, (error) => {
-      console.error("Error fetching stories for bar:", error);
-      setLoading(false);
-    });
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const allStories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Story));
+        setStories(allStories);
+        setLoading(false);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'stories');
+        setLoading(false);
+      });
 
-    return () => unsubscribe();
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Firestore stories fetch failed:", e);
+      setLoading(false);
+    }
   }, [user, followingUids]);
+
+  interface StoryUser {
+    uid: string;
+    name: string;
+    photo?: string;
+    stories: Story[];
+  }
 
   // Group stories by user
   const userStories = stories.reduce((acc, story) => {
@@ -223,37 +243,153 @@ const StoryBar = ({ user }: { user: User | null }) => {
     }
     acc[story.creatorUid].stories.push(story);
     return acc;
-  }, {} as Record<string, { uid: string, name: string, photo?: string, stories: Story[] }>);
+  }, {} as Record<string, StoryUser>);
 
-  const storyUsers = Object.values(userStories);
+  const storyUsers: StoryUser[] = Object.values(userStories);
+
+  const handleStoryUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+
+    setIsUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await fetch('/api/telegram/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Upload failed');
+        const publicUrl = result.url;
+        
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours later
+
+        await addDoc(collection(db, 'stories'), {
+          creatorUid: user.uid,
+          creatorName: user.displayName || 'Anonymous',
+          creatorPhoto: user.photoURL,
+          mediaUrl: publicUrl,
+          mediaType: file.type.startsWith('video') ? 'video' : 'image',
+          createdAt: now.toISOString(),
+          expiresAt: expiresAt.toISOString()
+        });
+        alert("Story uploaded successfully! 🇮🇳");
+      } else {
+        const text = await response.text();
+        console.error("Non-JSON response from server during story upload:", text);
+        throw new Error("Server returned an invalid response.");
+      }
+    } catch (err) {
+      console.error('Error uploading story:', err);
+      alert("Failed to upload story. Please try again.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const currentStoryUser = viewerState !== null ? storyUsers[viewerState.userIndex] : null;
+  const currentStory = currentStoryUser ? currentStoryUser.stories[viewerState!.storyIndex] : null;
+
+  const nextStory = () => {
+    if (!viewerState || !currentStoryUser) return;
+    
+    if (viewerState.storyIndex < currentStoryUser.stories.length - 1) {
+      // Next story of same user
+      setViewerState({ ...viewerState, storyIndex: viewerState.storyIndex + 1 });
+    } else if (viewerState.userIndex < storyUsers.length - 1) {
+      // First story of next user
+      setViewerState({ userIndex: viewerState.userIndex + 1, storyIndex: 0 });
+    } else {
+      // End of all stories
+      setViewerState(null);
+    }
+  };
+
+  const prevStory = () => {
+    if (!viewerState || !currentStoryUser) return;
+
+    if (viewerState.storyIndex > 0) {
+      // Prev story of same user
+      setViewerState({ ...viewerState, storyIndex: viewerState.storyIndex - 1 });
+    } else if (viewerState.userIndex > 0) {
+      // Last story of prev user
+      const prevUser = storyUsers[viewerState.userIndex - 1];
+      setViewerState({ userIndex: viewerState.userIndex - 1, storyIndex: prevUser.stories.length - 1 });
+    } else {
+      // Start of all stories
+      setViewerState(null);
+    }
+  };
 
   if (loading) return null;
 
   return (
     <div className="flex gap-4 p-4 overflow-x-auto scrollbar-hide border-b border-zinc-100 dark:border-zinc-800 bg-white dark:bg-black">
       {/* Add Story Button */}
-      <div className="flex flex-col items-center gap-1 flex-shrink-0">
+      <div 
+        className="flex flex-col items-center gap-1 flex-shrink-0 cursor-pointer"
+        onClick={() => fileInputRef.current?.click()}
+      >
         <div className="relative">
           <div className="w-16 h-16 rounded-full p-0.5 border-2 border-zinc-200 dark:border-zinc-700">
-            <img 
-              src={user?.photoURL || `https://ui-avatars.com/api/?name=${user?.displayName || 'User'}`} 
-              className="w-full h-full rounded-full object-cover"
-              alt="You"
-              referrerPolicy="no-referrer"
-            />
+            {isUploading ? (
+              <div className="w-full h-full rounded-full flex items-center justify-center bg-zinc-100 dark:bg-zinc-800">
+                <div className="w-6 h-6 border-2 border-orange-500 border-t-transparent rounded-full animate-spin" />
+              </div>
+            ) : (
+              <img 
+                src={user?.photoURL || `https://ui-avatars.com/api/?name=${user?.displayName || 'User'}`} 
+                className="w-full h-full rounded-full object-cover"
+                alt="You"
+                referrerPolicy="no-referrer"
+              />
+            )}
           </div>
           <div className="absolute bottom-0 right-0 bg-orange-500 text-white rounded-full p-0.5 border-2 border-white dark:border-black">
             <PlusSquare size={14} />
           </div>
         </div>
         <span className="text-[10px] text-zinc-500">Your Story</span>
+        <input 
+          type="file" 
+          ref={fileInputRef} 
+          className="hidden" 
+          accept="image/*,video/*" 
+          onChange={handleStoryUpload}
+        />
       </div>
 
+      {/* Own Stories if any */}
+      {userStories[user?.uid || ''] && (
+        <button 
+          onClick={() => setViewerState({ userIndex: storyUsers.findIndex(su => su.uid === user?.uid), storyIndex: 0 })}
+          className="flex flex-col items-center gap-1 flex-shrink-0"
+        >
+          <div className="w-16 h-16 rounded-full p-0.5 bg-gradient-to-tr from-orange-500 via-pink-500 to-yellow-500">
+            <div className="w-full h-full rounded-full p-0.5 bg-white dark:bg-black">
+              <img 
+                src={user?.photoURL || `https://ui-avatars.com/api/?name=${user?.displayName}`} 
+                className="w-full h-full rounded-full object-cover"
+                alt="Your Story"
+                referrerPolicy="no-referrer"
+              />
+            </div>
+          </div>
+          <span className="text-[10px] text-zinc-500">My Stories</span>
+        </button>
+      )}
+
       {/* Other Stories */}
-      {storyUsers.filter((su: any) => su.uid !== user?.uid).map((su: any) => (
+      {storyUsers.filter((su: any) => su.uid !== user?.uid).map((su: any, idx: number) => (
         <button 
           key={su.uid}
-          onClick={() => setSelectedStory(su.stories[0])}
+          onClick={() => setViewerState({ userIndex: storyUsers.findIndex(u => u.uid === su.uid), storyIndex: 0 })}
           className="flex flex-col items-center gap-1 flex-shrink-0"
         >
           <div className="w-16 h-16 rounded-full p-0.5 bg-gradient-to-tr from-orange-500 via-pink-500 to-yellow-500">
@@ -272,59 +408,85 @@ const StoryBar = ({ user }: { user: User | null }) => {
 
       {/* Story Viewer Modal */}
       <AnimatePresence>
-        {selectedStory && (
+        {viewerState !== null && currentStory && (
           <motion.div 
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.9 }}
-            className="fixed inset-0 z-[100] bg-black flex items-center justify-center"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] bg-black flex items-center justify-center overflow-hidden"
           >
+            {/* Close Button */}
             <button 
-              onClick={() => setSelectedStory(null)}
-              className="absolute top-6 right-6 text-white z-10 p-2 hover:bg-white/10 rounded-full"
+              onClick={() => setViewerState(null)}
+              className="absolute top-6 right-6 text-white z-[110] p-2 hover:bg-white/10 rounded-full"
             >
               <X size={32} />
             </button>
 
-            <div className="relative w-full max-w-lg h-full md:h-[90vh] md:rounded-2xl overflow-hidden bg-zinc-900">
-              {/* Progress Bar */}
-              <div className="absolute top-4 left-4 right-4 flex gap-1 z-20">
-                <div className="h-1 flex-1 bg-white/30 rounded-full overflow-hidden">
-                  <motion.div 
-                    initial={{ width: 0 }}
-                    animate={{ width: '100%' }}
-                    transition={{ duration: 5, ease: 'linear' }}
-                    onAnimationComplete={() => setSelectedStory(null)}
-                    className="h-full bg-white"
-                  />
-                </div>
+            {/* Navigation Areas */}
+            <div className="absolute inset-0 z-[105] flex">
+              <div className="flex-1 h-full cursor-pointer" onClick={prevStory} />
+              <div className="flex-1 h-full cursor-pointer" onClick={nextStory} />
+            </div>
+
+            <div className="relative w-full max-w-lg h-full md:h-[90vh] md:rounded-2xl overflow-hidden bg-zinc-900 shadow-2xl">
+              {/* Progress Bars */}
+              <div className="absolute top-4 left-4 right-4 flex gap-1.5 z-[110]">
+                {currentStoryUser?.stories.map((s, i) => (
+                  <div key={s.id} className="h-0.5 flex-1 bg-white/20 rounded-full overflow-hidden">
+                    <motion.div 
+                      key={`${viewerState.userIndex}-${i}`}
+                      initial={{ width: i < viewerState.storyIndex ? '100%' : '0%' }}
+                      animate={{ width: i === viewerState.storyIndex ? '100%' : (i < viewerState.storyIndex ? '100%' : '0%') }}
+                      transition={{ 
+                        duration: i === viewerState.storyIndex ? 5 : 0, 
+                        ease: 'linear' 
+                      }}
+                      onAnimationComplete={() => {
+                        if (i === viewerState.storyIndex) nextStory();
+                      }}
+                      className="h-full bg-white"
+                    />
+                  </div>
+                ))}
               </div>
 
               {/* Header */}
-              <div className="absolute top-8 left-4 flex items-center gap-3 z-20">
+              <div className="absolute top-8 left-4 flex items-center gap-3 z-[110]">
                 <img 
-                  src={selectedStory.creatorPhoto || `https://ui-avatars.com/api/?name=${selectedStory.creatorName}`}
-                  className="w-8 h-8 rounded-full border border-white/20"
-                  alt={selectedStory.creatorName}
+                  src={currentStory.creatorPhoto || `https://ui-avatars.com/api/?name=${currentStory.creatorName}`}
+                  className="w-9 h-9 rounded-full border-2 border-white/20"
+                  alt={currentStory.creatorName}
                   referrerPolicy="no-referrer"
                 />
-                <span className="text-white font-medium text-sm shadow-sm">{selectedStory.creatorName}</span>
+                <div className="flex flex-col">
+                  <span className="text-white font-bold text-sm drop-shadow-md">{currentStory.creatorName}</span>
+                  <span className="text-white/70 text-[10px] drop-shadow-md">
+                    {new Date(currentStory.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                </div>
               </div>
 
-              {selectedStory.mediaType === 'video' ? (
-                <video 
-                  src={selectedStory.mediaUrl} 
-                  autoPlay 
-                  className="w-full h-full object-contain"
-                />
-              ) : (
-                <img 
-                  src={selectedStory.mediaUrl} 
-                  className="w-full h-full object-contain"
-                  alt="Story"
-                  referrerPolicy="no-referrer"
-                />
-              )}
+              {/* Media Content */}
+              <div className="w-full h-full flex items-center justify-center">
+                {currentStory.mediaType === 'video' ? (
+                  <video 
+                    key={currentStory.id}
+                    src={currentStory.mediaUrl} 
+                    autoPlay 
+                    playsInline
+                    className="w-full h-full object-contain"
+                  />
+                ) : (
+                  <img 
+                    key={currentStory.id}
+                    src={currentStory.mediaUrl} 
+                    className="w-full h-full object-contain"
+                    alt="Story"
+                    referrerPolicy="no-referrer"
+                  />
+                )}
+              </div>
             </div>
           </motion.div>
         )}
@@ -845,6 +1007,7 @@ const AuthScreen = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [username, setUsername] = useState('');
+  const [fullName, setFullName] = useState('');
   const [profilePic, setProfilePic] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -918,17 +1081,39 @@ const AuthScreen = () => {
         let photoURL = '';
 
         if (profilePic) {
-          const storageRef = ref(storage, `profile_pics/${result.user.uid}`);
-          await uploadBytes(storageRef, profilePic);
-          photoURL = await getDownloadURL(storageRef);
+          const formData = new FormData();
+          formData.append('file', profilePic);
+          
+          try {
+            const uploadRes = await fetch('/api/telegram/upload', {
+              method: 'POST',
+              body: formData
+            });
+            
+            const contentType = uploadRes.headers.get("content-type");
+            if (contentType && contentType.indexOf("application/json") !== -1) {
+              const uploadData = await uploadRes.json();
+              if (uploadData.success) {
+                photoURL = uploadData.url;
+              }
+            } else {
+              const text = await uploadRes.text();
+              console.error("Non-JSON response from server during signup:", text);
+            }
+          } catch (uploadErr) {
+            console.error("Profile pic upload to Telegram failed:", uploadErr);
+          }
         }
 
+        const finalDisplayName = fullName || username || 'Indian Reels User';
+        const finalUsername = username.toLowerCase().replace(/\s/g, '');
+
         await updateProfile(result.user, {
-          displayName: username,
+          displayName: finalDisplayName,
           photoURL: photoURL
         });
 
-        await createSupabaseProfile(result.user, username, photoURL, username);
+        await createSupabaseProfile(result.user, finalDisplayName, photoURL, finalUsername);
       }
     } catch (err: any) {
       console.error("Email auth error:", err);
@@ -995,6 +1180,20 @@ const AuthScreen = () => {
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
                   <UserIcon className="text-zinc-400" size={18} />
+                </div>
+                <input 
+                  type="text"
+                  placeholder="Full Name"
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  className="w-full pl-11 pr-4 py-3.5 bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800 rounded-2xl outline-none focus:ring-2 focus:ring-orange-500 transition-all text-sm dark:text-white"
+                  required
+                />
+              </div>
+
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                  <span className="text-zinc-400 font-bold text-sm">@</span>
                 </div>
                 <input 
                   type="text"
@@ -1124,30 +1323,42 @@ const ProfileScreen = ({
   const [saving, setSaving] = useState(false);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
+  // Sync edit states when userProfile changes
+  useEffect(() => {
+    setEditName(userProfile.displayName);
+    setEditUsername(userProfile.username || '');
+    setEditBio(userProfile.bio || '');
+    setEditPhoto(userProfile.photoURL || '');
+  }, [userProfile]);
+
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !currentUser) return;
 
     setUploadingPhoto(true);
     try {
-      const fileExt = file.name.split('.').pop();
-      const fileName = `${currentUser.uid}-${Math.random()}.${fileExt}`;
-      const filePath = `avatars/${fileName}`;
+      const formData = new FormData();
+      formData.append('file', file);
 
-      const { error: uploadError } = await supabase.storage
-        .from('media')
-        .upload(filePath, file);
+      const response = await fetch('/api/telegram/upload', {
+        method: 'POST',
+        body: formData
+      });
 
-      if (uploadError) throw uploadError;
-
-      const { data: { publicUrl } } = supabase.storage
-        .from('media')
-        .getPublicUrl(filePath);
-
-      setEditPhoto(publicUrl);
-    } catch (err) {
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Upload failed');
+        console.log("Photo uploaded to Telegram successfully:", result.url);
+        setEditPhoto(result.url);
+      } else {
+        const text = await response.text();
+        console.error("Non-JSON response from server:", text);
+        throw new Error("Server returned an invalid response. Please check if the Telegram Bot Token is set.");
+      }
+    } catch (err: any) {
       console.error('Error uploading avatar:', err);
-      alert('Failed to upload photo');
+      alert('Failed to upload photo: ' + (err.message || "Unknown error"));
     } finally {
       setUploadingPhoto(false);
     }
@@ -1197,35 +1408,102 @@ const ProfileScreen = ({
     if (!isOwnProfile || !currentUser) return;
     setSaving(true);
     try {
-      const { error } = await supabase
-        .from('profiles')
-        .update({
-          display_name: editName,
-          username: editUsername.toLowerCase().replace(/\s/g, ''),
-          bio: editBio,
-          photo_url: editPhoto
-        })
-        .eq('id', currentUser.uid);
-
-      if (error) throw error;
+      const formattedUsername = editUsername.toLowerCase().replace(/\s/g, '');
       
-      // Also update Firestore if it exists
+      console.log("Saving profile changes...", {
+        displayName: editName,
+        username: formattedUsername,
+        bio: editBio,
+        photoURL: editPhoto
+      });
+
+      // Update Firestore
       try {
+        console.log("Updating Firestore profile...");
         await setDoc(doc(db, 'users', currentUser.uid), {
           displayName: editName,
-          username: editUsername.toLowerCase().replace(/\s/g, ''),
+          username: formattedUsername,
           photoURL: editPhoto,
           bio: editBio,
-          uid: currentUser.uid
+          uid: currentUser.uid,
+          updatedAt: serverTimestamp()
         }, { merge: true });
-      } catch (e) {
-        console.log("Firestore update skipped or failed", e);
+        console.log("Firestore profile updated.");
+      } catch (firestoreError) {
+        console.error("Firestore update failed", firestoreError);
       }
 
-      setShowEditModal(false);
-      refreshProfile();
-    } catch (error) {
+      // Update Supabase if configured
+      if (supabaseUrl && supabaseAnonKey) {
+        console.log("Updating Supabase profile...");
+        const { error: supabaseError } = await supabase
+          .from('profiles')
+          .update({
+            display_name: editName,
+            username: formattedUsername,
+            bio: editBio,
+            photo_url: editPhoto
+          })
+          .eq('id', currentUser.uid);
+
+        if (supabaseError) {
+          console.warn("Supabase update failed, but continuing with Firestore.", supabaseError);
+        } else {
+          console.log("Supabase profile updated.");
+        }
+      }
+      
+      // Update Firebase Auth Profile
+      try {
+        await updateProfile(currentUser, {
+          displayName: editName,
+          photoURL: editPhoto
+        });
+      } catch (authError) {
+        console.error("Firebase Auth update failed", authError);
+      }
+
+      // Update denormalized data in Reels (Supabase)
+      try {
+        await supabase
+          .from('reels')
+          .update({
+            creator_name: editName,
+            creator_photo: editPhoto
+          })
+          .eq('creator_uid', currentUser.uid);
+      } catch (reelsError) {
+        console.error("Reels update failed", reelsError);
+      }
+
+      // Update denormalized data in Stories (Firestore)
+      try {
+        const storiesRef = collection(db, 'stories');
+        const q = query(storiesRef, where('creatorUid', '==', currentUser.uid));
+        const querySnapshot = await getDocs(q);
+        const batch = writeBatch(db);
+        querySnapshot.forEach((doc) => {
+          batch.update(doc.ref, {
+            creatorName: editName,
+            creatorPhoto: editPhoto
+          });
+        });
+        await batch.commit();
+      } catch (storiesError) {
+        console.error("Stories update failed", storiesError);
+      }
+
+      alert("Profile updated successfully! 🇮🇳");
+      console.log("Profile update complete. Refreshing...");
+      
+      // Small delay to ensure DB consistency before refresh
+      setTimeout(() => {
+        setShowEditModal(false);
+        refreshProfile();
+      }, 500);
+    } catch (error: any) {
       console.error("Update profile error", error);
+      alert("Failed to update profile: " + (error.message || "Unknown error"));
     } finally {
       setSaving(false);
     }
@@ -1508,27 +1786,32 @@ const UploadScreen = ({ user, onComplete }: { user: User, onComplete: () => void
 
   const handleUpload = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!videoUrl && !videoFile) return;
-    if (!caption) return;
-    if (type === 'ad' && !adLink) return;
+    if (!videoUrl && !videoFile) {
+      alert("Please select a video file or provide a URL.");
+      return;
+    }
+    if (!caption) {
+      alert("Please add a caption.");
+      return;
+    }
+    if (type === 'ad' && !adLink) {
+      alert("Please provide an ad destination link.");
+      return;
+    }
     
     setLoading(true);
     setUploadProgress(0);
     try {
       let finalVideoUrl = videoUrl;
 
-      // If a file is selected, upload to Supabase with progress
+      // If a file is selected, upload to Telegram via proxy
       if (videoFile) {
-        const fileExt = videoFile.name.split('.').pop();
-        const fileName = `${Math.random()}.${fileExt}`;
-        const filePath = `${user.uid}/${fileName}`;
-
-        // Using XMLHttpRequest for real progress tracking
-        const uploadWithProgress = (file: File, path: string) => {
+        const uploadWithProgress = (file: File) => {
           return new Promise<string>((resolve, reject) => {
+            const formData = new FormData();
+            formData.append('file', file);
+
             const xhr = new XMLHttpRequest();
-            const supabaseUrl = (import.meta as any).env.VITE_SUPABASE_URL;
-            const supabaseKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
             
             xhr.upload.onprogress = (event) => {
               if (event.lengthComputable) {
@@ -1538,55 +1821,35 @@ const UploadScreen = ({ user, onComplete }: { user: User, onComplete: () => void
             };
 
             xhr.onload = () => {
-              if (xhr.status === 200) {
-                const { data: { publicUrl } } = supabase.storage
-                  .from('media')
-                  .getPublicUrl(path);
-                resolve(publicUrl);
+              const contentType = xhr.getResponseHeader("content-type");
+              if (xhr.status === 200 || xhr.status === 201) {
+                if (contentType && contentType.indexOf("application/json") !== -1) {
+                  const response = JSON.parse(xhr.responseText);
+                  resolve(response.url);
+                } else {
+                  reject(new Error('Server returned an invalid response.'));
+                }
               } else {
-                reject(new Error('Upload failed'));
+                if (contentType && contentType.indexOf("application/json") !== -1) {
+                  const response = JSON.parse(xhr.responseText);
+                  reject(new Error(response.error || 'Upload failed'));
+                } else {
+                  reject(new Error('Upload failed with server error.'));
+                }
               }
             };
 
             xhr.onerror = () => reject(new Error('Network error'));
 
-            xhr.open('POST', `${supabaseUrl}/storage/v1/object/media/${path}`, true);
-            xhr.setRequestHeader('Authorization', `Bearer ${supabaseKey}`);
-            xhr.setRequestHeader('apikey', supabaseKey);
-            xhr.send(file);
+            xhr.open('POST', '/api/telegram/upload', true);
+            xhr.send(formData);
           });
         };
 
-        finalVideoUrl = await uploadWithProgress(videoFile, filePath);
-
-        // Optional: Send to Telegram if configured
-        // We use the backend proxy to avoid CORS issues and keep the bot token secure
-        try {
-          const formData = new FormData();
-          // We don't send the chat_id from frontend if we want it to be secure, 
-          // but here we'll pass it to the proxy which will use the server-side token
-          const chatId = import.meta.env.VITE_TELEGRAM_CHAT_ID;
-          if (chatId) {
-            formData.append('chat_id', chatId);
-            formData.append('video', videoFile);
-            formData.append('caption', `New Reel by ${user.displayName}\nCaption: ${caption}\nLink: ${finalVideoUrl}`);
-            
-            const response = await fetch('/api/telegram/sendVideo', {
-              method: 'POST',
-              body: formData
-            });
-            
-            if (!response.ok) {
-              const errorData = await response.json();
-              throw new Error(errorData.error || 'Telegram proxy failed');
-            }
-          }
-        } catch (err) {
-          console.error("Telegram notification failed", err);
-        }
+        finalVideoUrl = await uploadWithProgress(videoFile);
       }
 
-      // Save to Supabase Database instead of Firestore to save storage/quota
+      // Save to Supabase Database
       const { data: reelData, error: dbError } = await supabase
         .from('reels')
         .insert([{
@@ -1612,151 +1875,163 @@ const UploadScreen = ({ user, onComplete }: { user: User, onComplete: () => void
       setAdLink('');
       setUploadProgress(0);
       
+      alert("Shared successfully!");
       onComplete();
     } catch (error: any) {
       console.error("Upload error", error);
-      if (error.message === 'Bucket not found') {
-        alert("Error: Supabase Storage bucket 'media' not found. Please create a public bucket named 'media' in your Supabase dashboard.");
-      } else {
-        alert("Upload failed: " + (error.message || "Unknown error"));
-      }
+      alert("Upload failed: " + (error.message || "Unknown error"));
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-white dark:bg-black p-6 md:pl-20">
-      <h2 className="text-2xl font-bold mb-6">Create New</h2>
-      
-      <div className="flex gap-2 mb-8 p-1 bg-zinc-100 dark:bg-zinc-900 rounded-2xl">
-        {(['post', 'story', 'ad'] as ReelType[]).map((t) => (
-          <button
-            key={t}
-            onClick={() => setType(t)}
-            className={cn(
-              "flex-1 py-3 rounded-xl text-sm font-bold capitalize transition-all",
-              type === t 
-                ? "bg-white dark:bg-zinc-800 shadow-sm text-orange-500" 
-                : "text-zinc-500"
-            )}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
-
-      <form onSubmit={handleUpload} className="space-y-6">
-        <div className="space-y-4">
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-medium text-zinc-500">Upload Video File</label>
-            <div className="relative group">
-              <input 
-                type="file" 
-                accept="video/*"
-                onChange={(e) => setVideoFile(e.target.files?.[0] || null)}
-                className="hidden"
-                id="video-upload"
-              />
-              <label 
-                htmlFor="video-upload"
-                className="flex flex-col items-center justify-center w-full h-48 border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-3xl cursor-pointer hover:border-orange-500 transition-colors bg-zinc-50 dark:bg-zinc-900"
-              >
-                {videoFile ? (
-                  <div className="text-center p-4">
-                    <Play className="mx-auto text-orange-500 mb-2" size={32} />
-                    <p className="text-sm font-bold truncate max-w-[200px]">{videoFile.name}</p>
-                    <p className="text-xs text-zinc-400 mt-1">Click to change</p>
-                  </div>
-                ) : (
-                  <div className="text-center p-4">
-                    <Upload className="mx-auto text-zinc-400 mb-2" size={32} />
-                    <p className="text-sm font-bold">Select Video File</p>
-                    <p className="text-xs text-zinc-400 mt-1">MP4, WebM or MOV</p>
-                  </div>
+    <div className="min-h-screen bg-white dark:bg-black p-4 md:p-8 md:pl-24">
+      <div className="max-w-2xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <h2 className="text-3xl font-black tracking-tighter">CREATE</h2>
+          <div className="flex gap-2 p-1 bg-zinc-100 dark:bg-zinc-900 rounded-2xl">
+            {(['post', 'story', 'ad'] as ReelType[]).map((t) => (
+              <button
+                key={t}
+                onClick={() => setType(t)}
+                className={cn(
+                  "px-6 py-2 rounded-xl text-xs font-bold capitalize transition-all",
+                  type === t 
+                    ? "bg-white dark:bg-zinc-800 shadow-md text-orange-500" 
+                    : "text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
                 )}
-              </label>
-            </div>
-          </div>
-
-          <div className="relative flex items-center py-4">
-            <div className="flex-grow border-t border-zinc-200 dark:border-zinc-800"></div>
-            <span className="flex-shrink mx-4 text-zinc-400 text-[10px] font-bold uppercase tracking-widest">OR</span>
-            <div className="flex-grow border-t border-zinc-200 dark:border-zinc-800"></div>
-          </div>
-
-          <div className="space-y-2">
-            <label className="text-sm font-medium text-zinc-500">Video URL (Telegram/Direct Link)</label>
-            <input 
-              type="url" 
-              value={videoUrl}
-              onChange={(e) => setVideoUrl(e.target.value)}
-              placeholder="https://example.com/video.mp4"
-              className="w-full p-4 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:ring-2 focus:ring-orange-500 outline-none transition-all"
-            />
+              >
+                {t}
+              </button>
+            ))}
           </div>
         </div>
         
-        <div className="space-y-2">
-          <label className="text-sm font-medium text-zinc-500">Caption</label>
-          <textarea 
-            value={caption}
-            onChange={(e) => setCaption(e.target.value)}
-            placeholder="Write a caption... #IndianReels"
-            className="w-full p-4 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:ring-2 focus:ring-orange-500 outline-none transition-all h-32 resize-none"
-            required
-          />
-        </div>
-
-        {type === 'ad' && (
-          <motion.div 
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="space-y-2"
-          >
-            <label className="text-sm font-medium text-zinc-500">Ad Destination Link</label>
-            <input 
-              type="url" 
-              value={adLink}
-              onChange={(e) => setAdLink(e.target.value)}
-              placeholder="https://your-website.com"
-              className="w-full p-4 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:ring-2 focus:ring-orange-500 outline-none transition-all"
-              required={type === 'ad'}
-            />
-          </motion.div>
-        )}
-
-        <button 
-          type="submit"
-          disabled={loading}
-          className="w-full py-4 bg-orange-500 text-white rounded-2xl font-bold hover:bg-orange-600 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
-        >
-          {loading ? (
-            <div className="flex flex-col items-center gap-2">
-              <div className="flex items-center gap-2">
-                <motion.div 
-                  animate={{ rotate: 360 }}
-                  transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
-                  className="w-6 h-6 border-2 border-white border-t-transparent rounded-full"
+        <form onSubmit={handleUpload} className="grid grid-cols-1 md:grid-cols-2 gap-8">
+          <div className="space-y-6">
+            <div className="flex flex-col gap-2">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Media Source</label>
+              
+              <div className="relative group">
+                <input 
+                  type="file" 
+                  accept="video/*"
+                  onChange={(e) => setVideoFile(e.target.files?.[0] || null)}
+                  className="hidden"
+                  id="video-upload"
                 />
-                <span>Uploading {uploadProgress}%</span>
+                <label 
+                  htmlFor="video-upload"
+                  className="flex flex-col items-center justify-center w-full aspect-[9/16] border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-[2rem] cursor-pointer hover:border-orange-500 transition-all bg-zinc-50 dark:bg-zinc-900/50 group-hover:bg-zinc-100 dark:group-hover:bg-zinc-900 overflow-hidden"
+                >
+                  {videoFile ? (
+                    <div className="relative w-full h-full flex flex-col items-center justify-center p-6 text-center">
+                      <div className="w-16 h-16 bg-orange-500/10 rounded-full flex items-center justify-center mb-4">
+                        <Play className="text-orange-500" size={32} />
+                      </div>
+                      <p className="text-sm font-bold truncate w-full px-4">{videoFile.name}</p>
+                      <p className="text-[10px] text-zinc-400 mt-2 uppercase tracking-widest">Click to change</p>
+                    </div>
+                  ) : (
+                    <div className="text-center p-6">
+                      <div className="w-16 h-16 bg-zinc-200 dark:bg-zinc-800 rounded-full flex items-center justify-center mb-4 mx-auto">
+                        <Upload className="text-zinc-400" size={32} />
+                      </div>
+                      <p className="text-sm font-bold">Select Video</p>
+                      <p className="text-[10px] text-zinc-400 mt-2 uppercase tracking-widest">MP4, WebM or MOV</p>
+                    </div>
+                  )}
+                </label>
               </div>
-              <div className="w-full h-1 bg-white/20 rounded-full overflow-hidden mt-2">
-                <motion.div 
-                  initial={{ width: 0 }}
-                  animate={{ width: `${uploadProgress}%` }}
-                  className="h-full bg-white"
-                />
-              </div>
+
+              {type === 'ad' && (
+                <div className="mt-4 space-y-2">
+                  <div className="relative flex items-center py-2">
+                    <div className="flex-grow border-t border-zinc-200 dark:border-zinc-800"></div>
+                    <span className="flex-shrink mx-4 text-zinc-400 text-[10px] font-bold uppercase tracking-widest">OR</span>
+                    <div className="flex-grow border-t border-zinc-200 dark:border-zinc-800"></div>
+                  </div>
+                  <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Video URL</label>
+                  <input 
+                    type="url" 
+                    value={videoUrl}
+                    onChange={(e) => setVideoUrl(e.target.value)}
+                    placeholder="https://example.com/video.mp4"
+                    className="w-full p-4 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:ring-2 focus:ring-orange-500 outline-none transition-all text-sm"
+                  />
+                </div>
+              )}
             </div>
-          ) : (
-            <>
-              <Camera size={20} />
-              Share {type === 'ad' ? 'Ad' : type === 'story' ? 'Story' : 'Reel'}
-            </>
-          )}
-        </button>
-      </form>
+          </div>
+
+          <div className="space-y-6">
+            <div className="space-y-2">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Caption</label>
+              <textarea 
+                value={caption}
+                onChange={(e) => setCaption(e.target.value)}
+                placeholder="What's happening? #IndianReels #DesiVibes"
+                className="w-full p-4 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:ring-2 focus:ring-orange-500 outline-none transition-all h-40 resize-none text-sm"
+                required
+              />
+            </div>
+
+            {type === 'ad' && (
+              <motion.div 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="space-y-2"
+              >
+                <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Ad Destination</label>
+                <div className="relative">
+                  <ExternalLink className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" size={18} />
+                  <input 
+                    type="url" 
+                    value={adLink}
+                    onChange={(e) => setAdLink(e.target.value)}
+                    placeholder="https://your-brand.com"
+                    className="w-full pl-12 pr-4 py-4 bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl focus:ring-2 focus:ring-orange-500 outline-none transition-all text-sm"
+                    required={type === 'ad'}
+                  />
+                </div>
+              </motion.div>
+            )}
+
+            <div className="p-4 bg-orange-500/5 border border-orange-500/10 rounded-2xl">
+              <p className="text-[10px] text-orange-600 dark:text-orange-400 font-bold uppercase tracking-widest mb-2">Pro Tip</p>
+              <p className="text-xs text-zinc-500">Vertical videos (9:16) perform 80% better on Indian Reels. Keep it short and catchy!</p>
+            </div>
+
+            <button 
+              type="submit"
+              disabled={loading}
+              className="w-full py-5 bg-orange-500 text-white rounded-2xl font-black text-lg hover:bg-orange-600 active:scale-[0.98] transition-all shadow-xl shadow-orange-500/20 disabled:opacity-50 flex flex-col items-center justify-center gap-1"
+            >
+              {loading ? (
+                <div className="w-full px-8">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm">Uploading...</span>
+                    <span className="text-sm">{uploadProgress}%</span>
+                  </div>
+                  <div className="w-full h-1.5 bg-white/20 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${uploadProgress}%` }}
+                      className="h-full bg-white"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <Upload size={24} />
+                  <span>SHARE {type.toUpperCase()}</span>
+                </div>
+              )}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 };
@@ -1774,41 +2049,53 @@ const StoriesScreen = ({ user }: { user: User }) => {
     const unsubscribeFollowing = onSnapshot(followingRef, (snapshot) => {
       const uids = snapshot.docs.map(doc => doc.id);
       setFollowingUids([...uids, user.uid]); // Include self
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/following`);
     });
 
     return () => unsubscribeFollowing();
   }, [user.uid]);
 
   useEffect(() => {
-    if (followingUids.length === 0) {
+    if (!user || followingUids.length === 0 || !db || typeof db.type !== 'string') {
       setLoading(false);
       return;
     }
 
-    const storiesRef = collection(db, 'stories');
-    const now = new Date().toISOString();
-    
-    // Firestore 'in' query is limited to 30 items. 
-    // For a prototype, we'll take the first 30 followed users.
-    const limitedFollowingUids = followingUids.slice(0, 30);
+    try {
+      const storiesRef = collection(db, 'stories');
+      const now = new Date().toISOString();
+      
+      // Firestore 'in' query is limited to 30 items. 
+      // For a prototype, we'll take the first 30 followed users.
+      const limitedFollowingUids = followingUids.slice(0, 30);
 
-    const q = query(
-      storiesRef,
-      where('creatorUid', 'in', limitedFollowingUids),
-      where('expiresAt', '>', now),
-      orderBy('expiresAt', 'asc')
-    );
+      if (limitedFollowingUids.length === 0) {
+        setLoading(false);
+        return;
+      }
 
-    const unsubscribeStories = onSnapshot(q, (snapshot) => {
-      const allStories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Story));
-      setStories(allStories);
+      const q = query(
+        storiesRef,
+        where('creatorUid', 'in', limitedFollowingUids),
+        where('expiresAt', '>', now),
+        orderBy('expiresAt', 'asc')
+      );
+
+      const unsubscribeStories = onSnapshot(q, (snapshot) => {
+        const allStories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Story));
+        setStories(allStories);
+        setLoading(false);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'stories');
+        setLoading(false);
+      });
+
+      return () => unsubscribeStories();
+    } catch (e) {
+      console.error("Firestore stories screen fetch failed:", e);
       setLoading(false);
-    }, (error) => {
-      console.error("Error fetching stories:", error);
-      setLoading(false);
-    });
-
-    return () => unsubscribeStories();
+    }
   }, [followingUids]);
 
   const handleStoryUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1817,32 +2104,37 @@ const StoriesScreen = ({ user }: { user: User }) => {
 
     setIsUploading(true);
     try {
-      const fileExt = file.name.split('.').pop();
-      const fileName = `${Math.random()}.${fileExt}`;
-      const filePath = `stories/${user.uid}/${fileName}`;
+      const formData = new FormData();
+      formData.append('file', file);
 
-      const { error: uploadError } = await supabase.storage
-        .from('media')
-        .upload(filePath, file);
-
-      if (uploadError) throw uploadError;
-
-      const { data: { publicUrl } } = supabase.storage
-        .from('media')
-        .getPublicUrl(filePath);
-
-      const now = new Date();
-      const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours later
-
-      await addDoc(collection(db, 'stories'), {
-        creatorUid: user.uid,
-        creatorName: user.displayName || 'Anonymous',
-        creatorPhoto: user.photoURL,
-        mediaUrl: publicUrl,
-        mediaType: file.type.startsWith('video') ? 'video' : 'image',
-        createdAt: now.toISOString(),
-        expiresAt: expiresAt.toISOString()
+      const response = await fetch('/api/telegram/upload', {
+        method: 'POST',
+        body: formData
       });
+
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Upload failed');
+        const publicUrl = result.url;
+        
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours later
+
+        await addDoc(collection(db, 'stories'), {
+          creatorUid: user.uid,
+          creatorName: user.displayName || 'Anonymous',
+          creatorPhoto: user.photoURL,
+          mediaUrl: publicUrl,
+          mediaType: file.type.startsWith('video') ? 'video' : 'image',
+          createdAt: now.toISOString(),
+          expiresAt: expiresAt.toISOString()
+        });
+      } else {
+        const text = await response.text();
+        console.error("Non-JSON response from server during story upload:", text);
+        throw new Error("Server returned an invalid response.");
+      }
     } catch (err) {
       console.error('Error uploading story:', err);
     } finally {
@@ -2168,82 +2460,130 @@ export default function App() {
   });
 
   useEffect(() => {
+    const root = window.document.documentElement;
     if (darkMode) {
-      document.documentElement.classList.add('dark');
+      root.classList.add('dark');
       localStorage.setItem('theme', 'dark');
     } else {
-      document.documentElement.classList.remove('dark');
+      root.classList.remove('dark');
       localStorage.setItem('theme', 'light');
     }
   }, [darkMode]);
+
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch('/api/health');
+        const data = await res.json();
+        console.log("API Health:", data);
+        if (!data.botTokenSet) {
+          console.warn("Telegram Bot Token is not set in the environment.");
+        }
+      } catch (e) {
+        console.error("API Health check failed:", e);
+      }
+    };
+    checkHealth();
+  }, []);
   const fetchUserProfile = async (u: User) => {
     if (!u) return;
     try {
-      // If Supabase is not configured, fallback immediately
-      if (!supabaseUrl || !supabaseAnonKey) {
+      // Try Supabase first if configured
+      if (supabaseUrl && supabaseAnonKey) {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', u.uid)
+          .single();
+        
+        if (data) {
+          setUserProfile({
+            uid: data.id,
+            displayName: data.display_name,
+            username: data.username || data.display_name.toLowerCase().replace(/\s/g, ''),
+            email: data.email,
+            photoURL: data.photo_url,
+            bio: data.bio,
+            isPrivate: data.is_private,
+            followersCount: data.followers_count,
+            followingCount: data.following_count,
+            createdAt: data.created_at
+          });
+          return;
+        } else if (error && error.code === 'PGRST116') {
+          // Profile not found, create one in Supabase
+          const baseUsername = u.displayName ? u.displayName.toLowerCase().replace(/\s/g, '') : 'user' + Math.floor(Math.random() * 1000);
+          const newProfile = {
+            id: u.uid,
+            display_name: u.displayName || 'Indian Reels User',
+            username: baseUsername,
+            email: u.email,
+            photo_url: u.photoURL,
+            bio: 'Namaste! I am new here.',
+            is_private: false,
+            followers_count: 0,
+            following_count: 0,
+            created_at: new Date().toISOString()
+          };
+          await supabase.from('profiles').insert([newProfile]);
+          setUserProfile({
+            uid: newProfile.id,
+            displayName: newProfile.display_name,
+            username: newProfile.username,
+            email: newProfile.email || '',
+            photoURL: newProfile.photo_url || undefined,
+            bio: newProfile.bio,
+            isPrivate: newProfile.is_private,
+            followersCount: newProfile.followers_count,
+            followingCount: newProfile.following_count,
+            createdAt: newProfile.created_at
+          });
+          return;
+        }
+      }
+
+      // Fallback to Firestore
+      console.log("Fetching profile from Firestore fallback...");
+      let userDoc;
+      try {
+        userDoc = await getDocFromServer(doc(db, 'users', u.uid));
+      } catch (serverError) {
+        console.warn("getDocFromServer failed, trying standard getDoc...", serverError);
+        userDoc = await getDoc(doc(db, 'users', u.uid));
+      }
+      
+      if (userDoc.exists()) {
+        const data = userDoc.data();
         setUserProfile({
           uid: u.uid,
-          displayName: u.displayName || 'User',
+          displayName: data.displayName || u.displayName || 'User',
+          username: data.username || (u.displayName ? u.displayName.toLowerCase().replace(/\s/g, '') : 'user'),
+          email: u.email || '',
+          photoURL: data.photoURL || u.photoURL || undefined,
+          bio: data.bio || 'Namaste! Welcome to my profile.',
+          isPrivate: data.isPrivate || false,
+          followersCount: data.followersCount || 0,
+          followingCount: data.followingCount || 0,
+          createdAt: data.createdAt || new Date().toISOString()
+        });
+      } else {
+        // Create initial profile in Firestore if not exists
+        const baseUsername = u.displayName ? u.displayName.toLowerCase().replace(/\s/g, '') : 'user' + Math.floor(Math.random() * 1000);
+        const initialProfile = {
+          uid: u.uid,
+          displayName: u.displayName || 'Indian Reels User',
+          username: baseUsername,
           email: u.email || '',
           photoURL: u.photoURL || undefined,
-          bio: 'Namaste! (Supabase not configured)',
+          bio: 'Namaste! I am new here.',
           isPrivate: false,
           followersCount: 0,
           followingCount: 0,
           createdAt: new Date().toISOString()
-        });
-        return;
-      }
-
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', u.uid)
-        .single();
-      
-      if (data) {
-        setUserProfile({
-          uid: data.id,
-          displayName: data.display_name,
-          username: data.username || data.display_name.toLowerCase().replace(/\s/g, ''),
-          email: data.email,
-          photoURL: data.photo_url,
-          bio: data.bio,
-          isPrivate: data.is_private,
-          followersCount: data.followers_count,
-          followingCount: data.following_count,
-          createdAt: data.created_at
-        });
-      } else if (error && error.code === 'PGRST116') {
-        // Profile not found, create one
-        const baseUsername = u.displayName ? u.displayName.toLowerCase().replace(/\s/g, '') : 'user' + Math.floor(Math.random() * 1000);
-        const newProfile = {
-          id: u.uid,
-          display_name: u.displayName || 'Indian Reels User',
-          username: baseUsername,
-          email: u.email,
-          photo_url: u.photoURL,
-          bio: 'Namaste! I am new here.',
-          is_private: false,
-          followers_count: 0,
-          following_count: 0,
-          created_at: new Date().toISOString()
         };
-        await supabase.from('profiles').insert([newProfile]);
-        setUserProfile({
-          uid: newProfile.id,
-          displayName: newProfile.display_name,
-          username: newProfile.username,
-          email: newProfile.email || '',
-          photoURL: newProfile.photo_url || undefined,
-          bio: newProfile.bio,
-          isPrivate: newProfile.is_private,
-          followersCount: newProfile.followers_count,
-          followingCount: newProfile.following_count,
-          createdAt: newProfile.created_at
-        });
-      } else if (error) {
-        throw error;
+        
+        await setDoc(doc(db, 'users', u.uid), initialProfile);
+        setUserProfile(initialProfile);
       }
     } catch (err) {
       console.error("Error fetching/creating profile:", err);
