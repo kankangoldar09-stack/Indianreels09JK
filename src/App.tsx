@@ -2768,14 +2768,14 @@ export default function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="h-[100dvh] overflow-y-scroll snap-y snap-mandatory md:pl-20 scrollbar-hide bg-black"
+              className="h-[100dvh] overflow-y-scroll snap-y snap-mandatory md:pl-20 scrollbar-hide bg-black overscroll-contain scroll-smooth touch-pan-y"
             >
               {reels.length > 0 ? (
                 reels.map(reel => (
                   <div 
                     key={reel.id} 
                     id={`reel-${reel.id}`}
-                    className="snap-start h-[100dvh] w-full"
+                    className="snap-start snap-always h-[100dvh] w-full relative"
                   >
                     <ReelCard 
                       reel={reel} 
