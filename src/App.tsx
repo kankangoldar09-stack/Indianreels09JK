@@ -717,6 +717,7 @@ const PostCard: React.FC<ReelCardProps> = ({ reel, currentUser, isMuted, setIsMu
 const ReelCard: React.FC<ReelCardProps> = ({ reel, currentUser, isMuted, setIsMuted }) => {
   const [liked, setLiked] = useState(false);
   const [likes, setLikes] = useState(reel.likesCount);
+  const [isFollowing, setIsFollowing] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [comments, setComments] = useState<ReelComment[]>([]);
   const [newComment, setNewComment] = useState('');
@@ -760,6 +761,20 @@ const ReelCard: React.FC<ReelCardProps> = ({ reel, currentUser, isMuted, setIsMu
     };
     checkLike();
   }, [reel.id, currentUser]);
+
+  useEffect(() => {
+    if (!currentUser || currentUser.uid === reel.creatorUid) return;
+    const checkFollow = async () => {
+      const { data } = await supabase
+        .from('follows')
+        .select('*')
+        .eq('follower_id', currentUser.uid)
+        .eq('following_id', reel.creatorUid)
+        .single();
+      setIsFollowing(!!data);
+    };
+    checkFollow();
+  }, [reel.creatorUid, currentUser]);
 
   useEffect(() => {
     if (!showComments) return;
@@ -853,6 +868,25 @@ const ReelCard: React.FC<ReelCardProps> = ({ reel, currentUser, isMuted, setIsMu
     }
   };
 
+  const handleFollow = async () => {
+    if (!currentUser || currentUser.uid === reel.creatorUid) return;
+
+    try {
+      if (isFollowing) {
+        await supabase.from('follows').delete().eq('follower_id', currentUser.uid).eq('following_id', reel.creatorUid);
+        await supabase.rpc('decrement_followers', { user_id: reel.creatorUid });
+        await supabase.rpc('decrement_following', { user_id: currentUser.uid });
+      } else {
+        await supabase.from('follows').insert([{ follower_id: currentUser.uid, following_id: reel.creatorUid }]);
+        await supabase.rpc('increment_followers', { user_id: reel.creatorUid });
+        await supabase.rpc('increment_following', { user_id: currentUser.uid });
+      }
+      setIsFollowing(!isFollowing);
+    } catch (err) {
+      console.error("Follow error:", err);
+    }
+  };
+
   return (
     <div className="relative h-full w-full bg-black flex items-center justify-center overflow-hidden">
       <video 
@@ -915,7 +949,19 @@ const ReelCard: React.FC<ReelCardProps> = ({ reel, currentUser, isMuted, setIsMu
             <span className="font-semibold text-sm">{reel.creatorName}</span>
             {reel.type === 'ad' && <span className="text-[10px] opacity-70">Ad</span>}
           </div>
-          <button className="ml-2 px-3 py-0.5 border border-white/50 rounded-lg text-xs font-medium hover:bg-white/20">Follow</button>
+          {currentUser && currentUser.uid !== reel.creatorUid && reel.type !== 'ad' && (
+            <button 
+              onClick={handleFollow}
+              className={cn(
+                "ml-2 px-3 py-0.5 border rounded-lg text-xs font-medium transition-colors",
+                isFollowing 
+                  ? "border-white/30 bg-white/10 text-white" 
+                  : "border-orange-500 bg-orange-500 text-white hover:bg-orange-600"
+              )}
+            >
+              {isFollowing ? 'Following' : 'Follow'}
+            </button>
+          )}
         </div>
         <p className="text-sm line-clamp-2 mb-3">{reel.caption}</p>
       </div>
@@ -1300,6 +1346,7 @@ const ProfileScreen = ({
   setDarkMode,
   allReels,
   onReelClick,
+  onViewProfile,
   refreshProfile
 }: { 
   userProfile: UserProfile, 
@@ -1309,11 +1356,16 @@ const ProfileScreen = ({
   setDarkMode: (d: boolean) => void,
   allReels: Reel[],
   onReelClick: (id: string) => void,
+  onViewProfile: (uid: string) => void,
   refreshProfile: () => void
 }) => {
   const [isFollowing, setIsFollowing] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showFollowersModal, setShowFollowersModal] = useState(false);
+  const [showFollowingModal, setShowFollowingModal] = useState(false);
+  const [followList, setFollowList] = useState<any[]>([]);
+  const [loadingFollowList, setLoadingFollowList] = useState(false);
   
   // Edit Profile States
   const [editName, setEditName] = useState(userProfile.displayName);
@@ -1391,17 +1443,67 @@ const ProfileScreen = ({
   const handleFollow = async () => {
     if (!currentUser || isOwnProfile) return;
 
-    if (isFollowing) {
-      await supabase.from('follows').delete().eq('follower_id', currentUser.uid).eq('following_id', userProfile.uid);
-      await supabase.rpc('decrement_followers', { user_id: userProfile.uid });
-      await supabase.rpc('decrement_following', { user_id: currentUser.uid });
-    } else {
-      await supabase.from('follows').insert([{ follower_id: currentUser.uid, following_id: userProfile.uid }]);
-      await supabase.rpc('increment_followers', { user_id: userProfile.uid });
-      await supabase.rpc('increment_following', { user_id: currentUser.uid });
+    try {
+      if (isFollowing) {
+        await supabase.from('follows').delete().eq('follower_id', currentUser.uid).eq('following_id', userProfile.uid);
+        const { error: err1 } = await supabase.rpc('decrement_followers', { user_id: userProfile.uid });
+        if (err1) await supabase.from('profiles').update({ followers_count: Math.max(0, userProfile.followersCount - 1) }).eq('id', userProfile.uid);
+        
+        const { error: err2 } = await supabase.rpc('decrement_following', { user_id: currentUser.uid });
+        if (err2) await supabase.from('profiles').update({ following_count: Math.max(0, (userProfile.uid === currentUser.uid ? userProfile.followingCount : 0) - 1) }).eq('id', currentUser.uid);
+      } else {
+        await supabase.from('follows').insert([{ follower_id: currentUser.uid, following_id: userProfile.uid }]);
+        const { error: err1 } = await supabase.rpc('increment_followers', { user_id: userProfile.uid });
+        if (err1) await supabase.from('profiles').update({ followers_count: userProfile.followersCount + 1 }).eq('id', userProfile.uid);
+        
+        const { error: err2 } = await supabase.rpc('increment_following', { user_id: currentUser.uid });
+        if (err2) await supabase.from('profiles').update({ following_count: (userProfile.uid === currentUser.uid ? userProfile.followingCount : 0) + 1 }).eq('id', currentUser.uid);
+      }
+      setIsFollowing(!isFollowing);
+      refreshProfile();
+    } catch (err) {
+      console.error("Follow error:", err);
     }
-    setIsFollowing(!isFollowing);
-    refreshProfile();
+  };
+
+  const fetchFollowers = async () => {
+    setLoadingFollowList(true);
+    setShowFollowersModal(true);
+    try {
+      const { data, error } = await supabase
+        .from('follows')
+        .select('follower_id, profiles!follows_follower_id_fkey(*)')
+        .eq('following_id', userProfile.uid);
+      
+      if (error) throw error;
+      if (data) {
+        setFollowList(data.map((f: any) => f.profiles));
+      }
+    } catch (err) {
+      console.error("Error fetching followers:", err);
+    } finally {
+      setLoadingFollowList(false);
+    }
+  };
+
+  const fetchFollowing = async () => {
+    setLoadingFollowList(true);
+    setShowFollowingModal(true);
+    try {
+      const { data, error } = await supabase
+        .from('follows')
+        .select('following_id, profiles!follows_following_id_fkey(*)')
+        .eq('follower_id', userProfile.uid);
+      
+      if (error) throw error;
+      if (data) {
+        setFollowList(data.map((f: any) => f.profiles));
+      }
+    } catch (err) {
+      console.error("Error fetching following:", err);
+    } finally {
+      setLoadingFollowList(false);
+    }
   };
 
   const handleUpdateProfile = async () => {
@@ -1565,11 +1667,11 @@ const ProfileScreen = ({
                 <div className="font-bold text-lg">{profileReels.length}</div>
                 <div className="text-xs text-zinc-500">Reels</div>
               </div>
-              <div>
+              <div className="cursor-pointer hover:opacity-70 transition-opacity" onClick={fetchFollowers}>
                 <div className="font-bold text-lg">{userProfile.followersCount}</div>
                 <div className="text-xs text-zinc-500">Followers</div>
               </div>
-              <div>
+              <div className="cursor-pointer hover:opacity-70 transition-opacity" onClick={fetchFollowing}>
                 <div className="font-bold text-lg">{userProfile.followingCount}</div>
                 <div className="text-xs text-zinc-500">Following</div>
               </div>
@@ -1771,11 +1873,133 @@ const ProfileScreen = ({
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Followers Modal */}
+      <AnimatePresence>
+        {showFollowersModal && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex items-center justify-center p-4"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              className="bg-white dark:bg-zinc-900 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col max-h-[80vh]"
+            >
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-xl font-bold">Followers</h3>
+                <button onClick={() => setShowFollowersModal(false)} className="text-zinc-500"><X size={24} /></button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+                {loadingFollowList ? (
+                  <div className="flex justify-center py-8">
+                    <div className="w-8 h-8 border-4 border-orange-500 border-t-transparent rounded-full animate-spin" />
+                  </div>
+                ) : followList.length > 0 ? (
+                  followList.map((user: any) => (
+                    <div 
+                      key={user.id} 
+                      className="flex items-center justify-between p-2 hover:bg-zinc-50 dark:hover:bg-zinc-800 rounded-2xl cursor-pointer transition-colors"
+                      onClick={() => {
+                        onViewProfile(user.id);
+                        setShowFollowersModal(false);
+                      }}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="w-12 h-12 rounded-full bg-zinc-200 overflow-hidden">
+                          {user.photo_url ? (
+                            <img src={user.photo_url} alt="" className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center font-bold text-zinc-500">
+                              {user.display_name?.[0] || 'U'}
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <p className="font-bold text-sm">{user.display_name}</p>
+                          <p className="text-xs text-zinc-500">@{user.username}</p>
+                        </div>
+                      </div>
+                      <button className="px-4 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-lg text-xs font-bold">View</button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-center py-12 text-zinc-500 italic">No followers yet</div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Following Modal */}
+      <AnimatePresence>
+        {showFollowingModal && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex items-center justify-center p-4"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              className="bg-white dark:bg-zinc-900 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col max-h-[80vh]"
+            >
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-xl font-bold">Following</h3>
+                <button onClick={() => setShowFollowingModal(false)} className="text-zinc-500"><X size={24} /></button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+                {loadingFollowList ? (
+                  <div className="flex justify-center py-8">
+                    <div className="w-8 h-8 border-4 border-orange-500 border-t-transparent rounded-full animate-spin" />
+                  </div>
+                ) : followList.length > 0 ? (
+                  followList.map((user: any) => (
+                    <div 
+                      key={user.id} 
+                      className="flex items-center justify-between p-2 hover:bg-zinc-50 dark:hover:bg-zinc-800 rounded-2xl cursor-pointer transition-colors"
+                      onClick={() => {
+                        onViewProfile(user.id);
+                        setShowFollowingModal(false);
+                      }}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="w-12 h-12 rounded-full bg-zinc-200 overflow-hidden">
+                          {user.photo_url ? (
+                            <img src={user.photo_url} alt="" className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center font-bold text-zinc-500">
+                              {user.display_name?.[0] || 'U'}
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <p className="font-bold text-sm">{user.display_name}</p>
+                          <p className="text-xs text-zinc-500">@{user.username}</p>
+                        </div>
+                      </div>
+                      <button className="px-4 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-lg text-xs font-bold">View</button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-center py-12 text-zinc-500 italic">Not following anyone yet</div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
 
-const UploadScreen = ({ user, onComplete }: { user: User, onComplete: () => void }) => {
+const UploadScreen = ({ user, userProfile, onComplete }: { user: User, userProfile: UserProfile | null, onComplete: () => void }) => {
   const [videoUrl, setVideoUrl] = useState('');
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [caption, setCaption] = useState('');
@@ -1850,12 +2074,12 @@ const UploadScreen = ({ user, onComplete }: { user: User, onComplete: () => void
       }
 
       // Save to Supabase Database
-      const { data: reelData, error: dbError } = await supabase
+      const { error: dbError } = await supabase
         .from('reels')
         .insert([{
           creator_uid: user.uid,
-          creator_name: user.displayName || 'User',
-          creator_photo: user.photoURL || '',
+          creator_name: userProfile?.displayName || user.displayName || 'Indian Reels User',
+          creator_photo: userProfile?.photoURL || user.photoURL || '',
           video_url: finalVideoUrl,
           caption,
           type,
@@ -1875,7 +2099,7 @@ const UploadScreen = ({ user, onComplete }: { user: User, onComplete: () => void
       setAdLink('');
       setUploadProgress(0);
       
-      alert("Shared successfully!");
+      alert("Shared successfully! 🇮🇳");
       onComplete();
     } catch (error: any) {
       console.error("Upload error", error);
@@ -2775,14 +2999,16 @@ export default function App() {
                   <div 
                     key={reel.id} 
                     id={`reel-${reel.id}`}
-                    className="snap-start snap-always h-[100dvh] w-full relative"
+                    className="snap-start snap-always h-[100dvh] w-full relative flex items-center justify-center bg-black"
                   >
-                    <ReelCard 
-                      reel={reel} 
-                      currentUser={user} 
-                      isMuted={isGlobalMuted}
-                      setIsMuted={setIsGlobalMuted}
-                    />
+                    <div className="h-full w-full max-w-md relative">
+                      <ReelCard 
+                        reel={reel} 
+                        currentUser={user} 
+                        isMuted={isGlobalMuted}
+                        setIsMuted={setIsGlobalMuted}
+                      />
+                    </div>
                   </div>
                 ))
               ) : (
@@ -2815,6 +3041,10 @@ export default function App() {
                       setSelectedReelId(id);
                       setActiveTab('reels');
                     }}
+                    onViewProfile={(uid) => {
+                      setViewingProfileUid(uid);
+                      setActiveTab('profile');
+                    }}
                     refreshProfile={() => {
                       if (viewingProfileUid) {
                         setViewingProfileUid(null);
@@ -2838,7 +3068,7 @@ export default function App() {
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
             >
-              <UploadScreen user={user} onComplete={() => setActiveTab('home')} />
+              <UploadScreen user={user} userProfile={userProfile} onComplete={() => setActiveTab('reels')} />
             </motion.div>
           )}
 
